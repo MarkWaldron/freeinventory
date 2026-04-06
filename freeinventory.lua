@@ -109,9 +109,9 @@ local function find_dupes(items)
         table.insert(grouped[item.id], item);
     end
 
-    local cross_bag = T{};
     local partial_stacks = T{};
-    local slots_freeable = 0;
+    local cross_bag_stackable = T{};
+    local cross_bag_gear = T{};
 
     for item_id, entries in pairs(grouped) do
         if (#entries < 2) then
@@ -121,7 +121,7 @@ local function find_dupes(items)
         local name = entries[1].name;
         local stack_size = entries[1].stack_size;
 
-        -- Cross-bag duplicates: same item in different bags
+        -- Group entries by bag
         local bags_seen = T{};
         for _, e in ipairs(entries) do
             if (bags_seen[e.bag_id] == nil) then
@@ -130,6 +130,33 @@ local function find_dupes(items)
             table.insert(bags_seen[e.bag_id], e);
         end
 
+        -- Partial stacks in the same bag (stackable items only)
+        if (stack_size > 1) then
+            for bag_id, bag_entries in pairs(bags_seen) do
+                if (#bag_entries > 1) then
+                    local total = 0;
+                    local counts = T{};
+                    for _, e in ipairs(bag_entries) do
+                        total = total + e.count;
+                        table.insert(counts, tostring(e.count));
+                    end
+                    local stacks_needed = math.ceil(total / stack_size);
+                    local freed = #bag_entries - stacks_needed;
+                    if (freed > 0) then
+                        table.insert(partial_stacks, {
+                            name       = name,
+                            bag_name   = get_container_name(bag_id),
+                            counts     = counts,
+                            total      = total,
+                            stack_size = stack_size,
+                            freed      = freed,
+                        });
+                    end
+                end
+            end
+        end
+
+        -- Cross-bag duplicates
         local unique_bags = T{};
         for bag_id, _ in pairs(bags_seen) do
             table.insert(unique_bags, bag_id);
@@ -137,42 +164,41 @@ local function find_dupes(items)
 
         if (#unique_bags > 1) then
             local locations = T{};
+            local total = 0;
+            local current_slots = 0;
             for _, e in ipairs(entries) do
                 table.insert(locations, string.format('%s x%d', e.bag_name, e.count));
+                total = total + e.count;
+                current_slots = current_slots + 1;
             end
-            table.insert(cross_bag, {
-                name      = name,
-                locations = locations,
-            });
-        end
 
-        -- Partial stacks in the same bag
-        for bag_id, bag_entries in pairs(bags_seen) do
-            if (#bag_entries > 1 and stack_size > 1) then
-                local total = 0;
-                for _, e in ipairs(bag_entries) do
-                    total = total + e.count;
-                end
+            if (stack_size > 1) then
                 local stacks_needed = math.ceil(total / stack_size);
-                local freed = #bag_entries - stacks_needed;
-                if (freed > 0) then
-                    slots_freeable = slots_freeable + freed;
-                    table.insert(partial_stacks, {
-                        name      = name,
-                        bag_name  = get_container_name(bag_id),
-                        stacks    = #bag_entries,
-                        total     = total,
-                        stack_size = stack_size,
-                        freed     = freed,
-                    });
-                end
+                local freed = current_slots - stacks_needed;
+                table.insert(cross_bag_stackable, {
+                    name       = name,
+                    locations  = locations,
+                    total      = total,
+                    stack_size = stack_size,
+                    stacks_needed = stacks_needed,
+                    freed      = freed,
+                });
+            else
+                table.insert(cross_bag_gear, {
+                    name      = name,
+                    locations = locations,
+                });
             end
         end
 
         ::next_item::
     end
 
-    return cross_bag, partial_stacks, slots_freeable;
+    -- Sort by slots freed descending
+    table.sort(partial_stacks, function(a, b) return a.freed > b.freed; end);
+    table.sort(cross_bag_stackable, function(a, b) return a.freed > b.freed; end);
+
+    return partial_stacks, cross_bag_stackable, cross_bag_gear;
 end
 
 ------------------------------------------------------------
@@ -181,42 +207,66 @@ end
 
 local function report_dupes()
     local items = scan_inventory();
-    local cross_bag, partial_stacks, slots_freeable = find_dupes(items);
+    local partial_stacks, cross_bag_stackable, cross_bag_gear = find_dupes(items);
 
     print(chat.header(addon.name):append(chat.message('Scanning ' .. #items .. ' items across all bags...')));
 
-    -- Cross-bag dupes
-    if (#cross_bag > 0) then
-        print(chat.header(addon.name):append(chat.success('Cross-bag duplicates:')));
-        for _, dupe in ipairs(cross_bag) do
-            print(chat.header(addon.name)
-                :append(chat.message('  ' .. dupe.name .. ' -> ' .. table.concat(dupe.locations, ', '))));
-        end
-    else
-        print(chat.header(addon.name):append(chat.message('No cross-bag duplicates found.')));
+    -- Section 1: Partial stacks in same bag (quick wins)
+    local partial_freed = 0;
+    for _, ps in ipairs(partial_stacks) do
+        partial_freed = partial_freed + ps.freed;
     end
 
-    -- Partial stacks
     if (#partial_stacks > 0) then
-        print(chat.header(addon.name):append(chat.success('Partial stacks that can merge:')));
+        print(chat.header(addon.name):append(chat.success(
+            string.format('=== Quick wins: merge partial stacks (free %d slots) ===', partial_freed))));
         for _, ps in ipairs(partial_stacks) do
-            print(chat.header(addon.name)
-                :append(chat.message(string.format('  %s in %s: %d stacks, %d total (max %d) - free %d slot(s)',
-                    ps.name, ps.bag_name, ps.stacks, ps.total, ps.stack_size, ps.freed))));
+            print(chat.header(addon.name):append(chat.message(
+                string.format('  %s in %s: %s = %d (max %d) -> free %d slot(s)',
+                    ps.name, ps.bag_name, table.concat(ps.counts, '+'),
+                    ps.total, ps.stack_size, ps.freed))));
         end
     else
-        print(chat.header(addon.name):append(chat.message('No mergeable partial stacks found.')));
+        print(chat.header(addon.name):append(chat.message('No partial stacks to merge.')));
+    end
+
+    -- Section 2: Stackable cross-bag consolidation
+    local cross_freed = 0;
+    for _, cb in ipairs(cross_bag_stackable) do
+        cross_freed = cross_freed + cb.freed;
+    end
+
+    if (#cross_bag_stackable > 0) then
+        print(chat.header(addon.name):append(chat.success(
+            string.format('=== Consolidate stackables across bags (free %d slots) ===', cross_freed))));
+        for _, cb in ipairs(cross_bag_stackable) do
+            print(chat.header(addon.name):append(chat.message(
+                string.format('  %s: %s = %d/%d -> %d stack(s) (free %d)',
+                    cb.name, table.concat(cb.locations, ' + '),
+                    cb.total, cb.stack_size, cb.stacks_needed, cb.freed))));
+        end
+    else
+        print(chat.header(addon.name):append(chat.message('No stackable cross-bag dupes found.')));
+    end
+
+    -- Section 3: Unstackable gear dupes (FYI)
+    if (#cross_bag_gear > 0) then
+        print(chat.header(addon.name):append(chat.message('=== FYI: unstackable dupes across bags ===')));
+        for _, g in ipairs(cross_bag_gear) do
+            print(chat.header(addon.name):append(chat.message(
+                '  ' .. g.name .. ' -> ' .. table.concat(g.locations, ', '))));
+        end
     end
 
     -- Summary
-    if (slots_freeable > 0) then
-        print(chat.header(addon.name)
-            :append(chat.success(string.format('You can free %d slot(s) by merging partial stacks!', slots_freeable))));
+    local total_freed = partial_freed + cross_freed;
+    if (total_freed > 0) then
+        print(chat.header(addon.name):append(chat.success(
+            string.format('Total: %d slot(s) freeable (%d from merging, %d from consolidating)',
+                total_freed, partial_freed, cross_freed))));
+    else
+        print(chat.header(addon.name):append(chat.message('No slots to free right now.')));
     end
-
-    print(chat.header(addon.name)
-        :append(chat.message(string.format('Found %d cross-bag dupe(s), %d mergeable stack(s).',
-            #cross_bag, #partial_stacks))));
 end
 
 local function export_inventory()
